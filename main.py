@@ -1,500 +1,741 @@
 # py -m PyInstaller --onefile --noconsole main.py
 
 
+import json
+import os
+import queue
+import socket
+import subprocess
+import sys
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk
-import os
-import sys
-import ctypes
+
+from PIL import Image
 
 
-if getattr(sys, "frozen", False):
-    app_folder = os.path.dirname(sys.executable)
-else:
-    app_folder = os.path.dirname(os.path.abspath(__file__))
-
-default_gif_path = os.path.join(app_folder, "test.gif")
-icon_path = os.path.join(app_folder, "buddy.ico")
-
-root = tk.Tk()
-root.overrideredirect(True)
-root.attributes("-transparentcolor", "white")
-root.attributes("-topmost", True)
-
-if os.path.exists(icon_path):
-    root.iconbitmap(icon_path)
-
-root.update_idletasks()
-
-if sys.platform == "win32":
-    user32 = ctypes.windll.user32
-    hwnd = user32.GetParent(root.winfo_id())
-
-    GWL_EXSTYLE = -20
-    WS_EX_TOOLWINDOW = 0x00000080
-    WS_EX_APPWINDOW = 0x00040000
-
-    styles = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-    styles = styles & ~WS_EX_TOOLWINDOW
-    styles = styles | WS_EX_APPWINDOW
-
-    user32.SetWindowLongW(hwnd, GWL_EXSTYLE, styles)
-
-    user32.SetWindowPos(
-        hwnd,
-        0,
-        0, 0, 0, 0,
-        0x0027
-    )
-
-original_frames = []
-frame_durations = []
-frames = []
-
-current_frame = 0
-size_scale = 1.0
-speed = 1.0
-animation_job = None
-settings_window = None
-
-label = tk.Label(
-    root,
-    bg="white",
-    borderwidth=0
+APP_DIR = (
+    os.path.dirname(os.path.abspath(sys.executable))
+    if getattr(sys, "frozen", False)
+    else os.path.dirname(os.path.abspath(__file__))
 )
-label.pack()
+DEFAULT_IMAGE = os.path.join(APP_DIR, "test.gif")
 
+def renderer_process(host, port, token):
+    from PySide6.QtCore import Qt, QTimer, QObject, Signal, Slot
+    from PySide6.QtGui import QImage, QPixmap
+    from PySide6.QtWidgets import QApplication, QLabel, QWidget
 
-def resize_frames():
-    global frames
+    class SocketReader(QObject):
+        received = Signal(dict)
+        disconnected = Signal()
 
-    frames = []
+        def __init__(self, connection):
+            super().__init__()
+            self.connection = connection
 
-    for frame in original_frames:
-        width = max(1, int(frame.width * size_scale))
-        height = max(1, int(frame.height * size_scale))
+        def run(self):
+            buffer = b""
+            try:
+                while True:
+                    data = self.connection.recv(65536)
+                    if not data:
+                        break
+                    buffer += data
 
-        resized = frame.resize(
-            (width, height),
-            Image.Resampling.LANCZOS
-        )
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        try:
+                            self.received.emit(json.loads(line))
+                        except (ValueError, UnicodeDecodeError):
+                            pass
+            except OSError:
+                pass
+            self.disconnected.emit()
 
-        frames.append(ImageTk.PhotoImage(resized))
+    class Character(QWidget):
+        def __init__(self, connection):
+            super().__init__()
 
+            self.connection = connection
+            self.send_lock = threading.Lock()
 
-def animate():
-    global current_frame
-    global animation_job
+            self.setWindowFlags(
+                Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.WindowStaysOnTopHint
+                | Qt.WindowType.Tool
+            )
+            self.setAttribute(
+                Qt.WidgetAttribute.WA_TranslucentBackground, True
+            )
+            self.setAttribute(
+                Qt.WidgetAttribute.WA_NoSystemBackground, True
+            )
+            self.setStyleSheet("background: transparent;")
 
-    if not frames:
-        animation_job = None
-        return
+            self.label = QLabel(self)
+            self.label.setStyleSheet("background: transparent;")
+            self.label.setAttribute(
+                Qt.WidgetAttribute.WA_TranslucentBackground, True
+            )
+            self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-    label.config(image=frames[current_frame])
+            self.frames = []
+            self.durations = []
+            self.frame_index = 0
+            self.scale = 1.0
+            self.speed = 1.0
+            self.drag_offset = None
 
-    if len(frames) == 1:
-        animation_job = None
-        return
+            self.timer = QTimer(self)
+            self.timer.timeout.connect(self.next_frame)
 
-    duration = frame_durations[current_frame]
-    current_frame = (current_frame + 1) % len(frames)
+            self.reader = SocketReader(connection)
+            self.reader.received.connect(self.handle_command)
+            self.reader.disconnected.connect(
+                QApplication.instance().quit
+            )
 
-    adjusted_duration = max(
-        10,
-        int(duration / speed)
+            threading.Thread(
+                target=self.reader.run,
+                daemon=True
+            ).start()
+
+            self.move(100, 100)
+            self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        def send(self, event, **data):
+            packet = {"event": event, **data}
+            try:
+                with self.send_lock:
+                    self.connection.sendall(
+                        (json.dumps(packet) + "\n").encode()
+                    )
+            except OSError:
+                QApplication.instance().quit()
+
+        @Slot(dict)
+        def handle_command(self, packet):
+            command = packet.get("command")
+
+            if command == "load":
+                self.load_image(packet.get("path", ""))
+
+            elif command == "size":
+                self.scale = float(packet["value"])
+                self.show_frame()
+
+            elif command == "speed":
+                self.speed = float(packet["value"])
+                self.schedule_frame()
+
+            elif command == "exit":
+                self.close()
+
+        def load_image(self, path):
+            try:
+                image = Image.open(path)
+                frames = []
+                durations = []
+
+                for i in range(getattr(image, "n_frames", 1)):
+                    image.seek(i)
+                    frames.append(image.convert("RGBA").copy())
+                    durations.append(
+                        max(20, int(image.info.get("duration", 100) or 100))
+                    )
+
+                if not frames:
+                    raise ValueError("No frames found in image.")
+
+                self.timer.stop()
+                self.frames = frames
+                self.durations = durations
+                self.frame_index = 0
+                self.show_frame()
+                self.schedule_frame()
+                self.send("image_loaded", path=path)
+
+            except Exception as error:
+                self.send("image_error", error=str(error))
+
+        def show_frame(self):
+            if not self.frames:
+                return
+
+            frame = self.frames[self.frame_index]
+            width = max(1, int(frame.width * self.scale))
+            height = max(1, int(frame.height * self.scale))
+
+            frame = frame.resize(
+                (width, height),
+                Image.Resampling.LANCZOS
+            )
+
+            qimage = QImage(
+                frame.tobytes(),
+                width,
+                height,
+                width * 4,
+                QImage.Format.Format_RGBA8888
+            ).copy()
+
+            self.label.setPixmap(QPixmap.fromImage(qimage))
+            self.label.resize(width, height)
+            self.resize(width, height)
+
+        def schedule_frame(self):
+            if len(self.frames) < 2:
+                self.timer.stop()
+                return
+
+            delay = int(
+                self.durations[self.frame_index] / max(0.05, self.speed)
+            )
+            self.timer.start(max(10, delay))
+
+        def next_frame(self):
+            if not self.frames:
+                return
+
+            self.frame_index = (
+                self.frame_index + 1
+            ) % len(self.frames)
+
+            self.show_frame()
+            self.schedule_frame()
+
+        def mousePressEvent(self, event):
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.drag_offset = (
+                    event.globalPosition().toPoint()
+                    - self.frameGeometry().topLeft()
+                )
+                self.activateWindow()
+                self.setFocus()
+                event.accept()
+
+            elif event.button() == Qt.MouseButton.RightButton:
+                self.send(
+                    "open_settings",
+                    x=self.x(),
+                    y=self.y(),
+                    width=self.width()
+                )
+                event.accept()
+
+            else:
+                super().mousePressEvent(event)
+
+        def mouseMoveEvent(self, event):
+            if (
+                self.drag_offset is not None
+                and event.buttons() & Qt.MouseButton.LeftButton
+            ):
+                self.move(
+                    event.globalPosition().toPoint() - self.drag_offset
+                )
+                event.accept()
+            else:
+                super().mouseMoveEvent(event)
+
+        def mouseReleaseEvent(self, event):
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.drag_offset = None
+            super().mouseReleaseEvent(event)
+
+        def keyPressEvent(self, event):
+            if event.key() == Qt.Key.Key_Escape:
+                self.send("exit_requested")
+                self.close()
+                return
+            super().keyPressEvent(event)
+
+        def closeEvent(self, event):
+            self.timer.stop()
+            event.accept()
+            QApplication.instance().quit()
+
+    connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    connection.settimeout(15)
+    connection.connect((host, int(port)))
+    connection.settimeout(None)
+
+    connection.sendall(
+        (json.dumps({"token": token}) + "\n").encode()
     )
 
-    animation_job = root.after(
-        adjusted_duration,
-        animate
-    )
+    app = QApplication(sys.argv[:1])
+    window = Character(connection)
+    window.show()
+    window.setFocus()
+    app.exec()
 
+    connection.close()
 
-def load_character(image_path):
-    global original_frames
-    global frame_durations
-    global current_frame
-    global animation_job
+class RendererController:
+    def __init__(self, root, callback):
+        self.root = root
+        self.callback = callback
+        self.messages = queue.Queue()
+        self.connection = None
+        self.closed = False
+        self.lock = threading.Lock()
 
-    try:
-        image = Image.open(image_path)
-
-        new_frames = []
-        new_durations = []
-
-        frame_count = getattr(image, "n_frames", 1)
-
-        for i in range(frame_count):
-            image.seek(i)
-
-            frame = image.convert("RGBA").copy()
-            new_frames.append(frame)
-
-            duration = image.info.get("duration", 100)
-            new_durations.append(max(20, int(duration or 100)))
-
-        if not new_frames:
-            raise ValueError("No image frames found.")
-
-        if animation_job is not None:
-            root.after_cancel(animation_job)
-            animation_job = None
-
-        original_frames = new_frames
-        frame_durations = new_durations
-        current_frame = 0
-
-        resize_frames()
-
-        label.config(image=frames[0])
-
-        animate()
-
-        return True
-
-    except Exception as error:
-        messagebox.showerror(
-            "Image Error",
-            f"Could not load image:\n\n{error}",
-            parent=root
+        self.listener = socket.socket(
+            socket.AF_INET, socket.SOCK_STREAM
         )
-        return False
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(1)
 
+        host, port = self.listener.getsockname()
+        self.host = host
+        self.port = port
+        self.token = os.urandom(24).hex()
 
-def change_size(value):
-    global size_scale
+        self.authenticated = threading.Event()
+        self.process = None
 
-    size_scale = float(value)
+    def start(self):
+        if getattr(sys, "frozen", False):
+            command = [
+                sys.executable,
+                "--kdesktop-renderer",
+                self.host,
+                str(self.port),
+                self.token
+            ]
+        else:
+            command = [
+                sys.executable,
+                os.path.abspath(__file__),
+                "--kdesktop-renderer",
+                self.host,
+                str(self.port),
+                self.token
+            ]
 
-    resize_frames()
+        options = {}
 
-    if frames:
-        label.config(image=frames[current_frame])
+        if sys.platform == "win32":
+            options["creationflags"] = subprocess.CREATE_NO_WINDOW
+            startup = subprocess.STARTUPINFO()
+            startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            options["startupinfo"] = startup
 
-
-def change_speed(value):
-    global speed, animation_job
-
-    speed = float(value)
-
-    if animation_job is not None:
-        root.after_cancel(animation_job)
-        animation_job = None
-        animate()
-
-
-def choose_image():
-    file_path = filedialog.askopenfilename(
-        parent=settings_window,
-        title="Choose Your Buddy",
-        filetypes=[
-            ("Supported images", "*.gif *.png *.jpg *.jpeg *.bmp *.webp"),
-            ("GIF files", "*.gif"),
-            ("PNG files", "*.png"),
-            ("JPEG files", "*.jpg *.jpeg"),
-            ("All files", "*.*")
-        ]
-    )
-
-    if file_path:
-        load_character(file_path)
-
-
-def reset_character():
-    if os.path.exists(default_gif_path):
-        load_character(default_gif_path)
-    else:
-        messagebox.showerror(
-            "Missing Default",
-            "Could not find test.gif next to the application.",
-            parent=settings_window
+        self.process = subprocess.Popen(
+            command,
+            cwd=APP_DIR,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **options
         )
 
+        threading.Thread(
+            target=self.accept_connection,
+            daemon=True
+        ).start()
 
-def start_drag(event):
-    root.x = event.x
-    root.y = event.y
+        self.root.after(30, self.poll_messages)
+        self.root.after(500, self.monitor_process)
 
-
-def drag(event):
-    x = root.winfo_pointerx() - root.x
-    y = root.winfo_pointery() - root.y
-
-    root.geometry(f"+{x}+{y}")
-
-
-label.bind("<Button-1>", start_drag)
-label.bind("<B1-Motion>", drag)
-
-
-def close_settings():
-    global settings_window
-
-    if settings_window is not None:
+    def accept_connection(self):
         try:
-            settings_window.destroy()
+            self.listener.settimeout(20)
+            connection, _ = self.listener.accept()
+            reader = connection.makefile("rb")
+            auth = json.loads(reader.readline().decode())
+
+            if auth.get("token") != self.token:
+                connection.close()
+                return
+
+            self.connection = connection
+            self.authenticated.set()
+            self.messages.put({"event": "connected"})
+
+            for line in reader:
+                try:
+                    self.messages.put(json.loads(line.decode()))
+                except (ValueError, UnicodeDecodeError):
+                    pass
+
+        except Exception as error:
+            if not self.closed:
+                self.messages.put({
+                    "event": "renderer_error",
+                    "error": str(error)
+                })
+
+        finally:
+            self.messages.put({"event": "disconnected"})
+
+    def send(self, command, **data):
+        if self.connection is None or self.closed:
+            return
+
+        packet = {"command": command, **data}
+
+        try:
+            with self.lock:
+                self.connection.sendall(
+                    (json.dumps(packet) + "\n").encode()
+                )
+        except OSError:
+            pass
+
+    def poll_messages(self):
+        if self.closed:
+            return
+
+        try:
+            while True:
+                self.callback(self.messages.get_nowait())
+        except queue.Empty:
+            pass
+
+        self.root.after(30, self.poll_messages)
+
+    def monitor_process(self):
+        if self.closed:
+            return
+
+        if self.process and self.process.poll() is not None:
+            self.callback({
+                "event": "renderer_process_exited",
+                "code": self.process.returncode
+            })
+            return
+
+        self.root.after(500, self.monitor_process)
+
+    def close(self):
+        if self.closed:
+            return
+
+        self.send("exit")
+        self.closed = True
+
+        try:
+            self.listener.close()
+        except OSError:
+            pass
+
+        if self.connection:
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+            except OSError:
+                pass
+
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.terminate()
+
+
+def run_controller():
+    root = tk.Tk()
+    root.withdraw()
+
+    renderer = None
+    settings_window = None
+    current_size = 1.0
+    current_speed = 1.0
+    shutting_down = False
+
+    def shutdown():
+        nonlocal shutting_down
+        if shutting_down:
+            return
+
+        shutting_down = True
+
+        if renderer:
+            renderer.close()
+
+        try:
+            root.destroy()
         except tk.TclError:
             pass
 
+    def change_size(value):
+        nonlocal current_size
+        current_size = float(value)
+        if renderer:
+            renderer.send("size", value=current_size)
+
+    def change_speed(value):
+        nonlocal current_speed
+        current_speed = float(value)
+        if renderer:
+            renderer.send("speed", value=current_speed)
+
+    def close_settings():
+        nonlocal settings_window
+
+        if settings_window:
+            try:
+                settings_window.destroy()
+            except tk.TclError:
+                pass
+
         settings_window = None
 
+    def choose_image():
+        if not settings_window:
+            return
 
-def open_settings(event=None):
-    global settings_window
+        path = filedialog.askopenfilename(
+            parent=settings_window,
+            title="Choose Your Buddy",
+            filetypes=[
+                ("Supported images",
+                 "*.gif *.png *.jpg *.jpeg *.bmp *.webp"),
+                ("All files", "*.*")
+            ]
+        )
 
-    if settings_window is not None:
-        try:
-            if settings_window.winfo_exists():
-                close_settings()
-                return
-        except tk.TclError:
-            settings_window = None
+        if path and renderer:
+            renderer.send("load", path=path)
 
-    settings_window = tk.Toplevel(root)
-    settings_window.title("Settings")
-    settings_window.geometry("255x390")
-    settings_window.resizable(False, False)
-    settings_window.attributes("-topmost", True)
+    def reset_image():
+        if os.path.exists(DEFAULT_IMAGE):
+            renderer.send("load", path=DEFAULT_IMAGE)
+        else:
+            messagebox.showerror(
+                "Missing Default",
+                "Could not find test.gif next to the application.",
+                parent=settings_window
+            )
 
-    root.update_idletasks()
+    def open_settings(x=110, y=100):
+        nonlocal settings_window
 
-    x = root.winfo_x() + root.winfo_width() + 10
-    y = root.winfo_y()
+        if settings_window:
+            close_settings()
+            return
 
-    settings_window.geometry(f"+{x}+{y}")
+        window = tk.Toplevel(root)
+        settings_window = window
 
-    bg = "#ECE9D8"
-    blue = "#316AC5"
-    dark_blue = "#1941A5"
-    text_color = "#222222"
+        window.title("Settings")
+        window.geometry(f"255x390+{int(x)}+{int(y)}")
+        window.resizable(False, False)
+        window.attributes("-topmost", True)
 
-    settings_window.configure(bg=bg)
+        bg = "#ECE9D8"
+        blue = "#316AC5"
+        dark_blue = "#1941A5"
 
-    outer = tk.Frame(
-        settings_window,
-        bg="#FFFFFF",
-        bd=2,
-        relief="raised"
-    )
-    outer.pack(
-        fill="both",
-        expand=True,
-        padx=3,
-        pady=3
-    )
+        window.configure(bg=bg)
 
-    title_bar = tk.Frame(
-        outer,
-        bg=blue,
-        height=28
-    )
-    title_bar.pack(fill="x")
-    title_bar.pack_propagate(False)
+        outer = tk.Frame(
+            window, bg="white", bd=2, relief="raised"
+        )
+        outer.pack(fill="both", expand=True, padx=3, pady=3)
 
-    tk.Label(
-        title_bar,
-        text="Character Settings",
-        bg=blue,
-        fg="white",
-        font=("Tahoma", 9, "bold")
-    ).pack(
-        side="left",
-        padx=8,
-        pady=4
-    )
+        title_bar = tk.Frame(outer, bg=blue, height=28)
+        title_bar.pack(fill="x")
+        title_bar.pack_propagate(False)
 
-    panel = tk.Frame(
-        outer,
-        bg=bg,
-        padx=12,
-        pady=10
-    )
-    panel.pack(
-        fill="both",
-        expand=True
-    )
+        tk.Label(
+            title_bar,
+            text="Character Settings",
+            bg=blue,
+            fg="white",
+            font=("Tahoma", 9, "bold")
+        ).pack(side="left", padx=8, pady=4)
 
-    tk.Label(
-        panel,
-        text="Change character size and playback speed",
-        bg=bg,
-        fg=dark_blue,
-        font=("Tahoma", 7, "bold")
-    ).pack(
-        anchor="w",
-        pady=(2, 5)
-    )
-    
-    tk.Label(
-        panel,
-        text="Character Size",
-        bg=bg,
-        fg=text_color,
-        font=("Tahoma", 9, "bold")
-    ).pack(anchor="w")
+        panel = tk.Frame(outer, bg=bg, padx=12, pady=10)
+        panel.pack(fill="both", expand=True)
 
-    size_slider = tk.Scale(
-        panel,
-        from_=0.3,
-        to=2.5,
-        resolution=0.1,
-        orient="horizontal",
-        command=change_size,
-        bg=bg,
-        fg=text_color,
-        troughcolor="#A6C8F0",
-        activebackground=blue,
-        highlightthickness=0,
-        bd=1,
-        relief="sunken",
-        font=("Tahoma", 8),
-        showvalue=True,
-        sliderlength=18
-    )
-    size_slider.set(size_scale)
-    size_slider.pack(
-        fill="x",
-        pady=(0, 8)
-    )
+        tk.Label(
+            panel,
+            text="Change character size and playback speed",
+            bg=bg,
+            fg=dark_blue,
+            font=("Tahoma", 7, "bold")
+        ).pack(anchor="w", pady=(2, 5))
 
-    tk.Label(
-        panel,
-        text="GIF Playback Speed",
-        bg=bg,
-        fg=text_color,
-        font=("Tahoma", 9, "bold")
-    ).pack(anchor="w")
+        tk.Label(
+            panel,
+            text="Character Size",
+            bg=bg,
+            font=("Tahoma", 9, "bold")
+        ).pack(anchor="w")
 
-    speed_slider = tk.Scale(
-        panel,
-        from_=0.25,
-        to=3.0,
-        resolution=0.25,
-        orient="horizontal",
-        command=change_speed,
-        bg=bg,
-        fg=text_color,
-        troughcolor="#A6C8F0",
-        activebackground=blue,
-        highlightthickness=0,
-        bd=1,
-        relief="sunken",
-        font=("Tahoma", 8),
-        showvalue=True,
-        sliderlength=18
-    )
-    speed_slider.set(speed)
-    speed_slider.pack(
-        fill="x",
-        pady=(0, 10)
-    )
+        size_slider = tk.Scale(
+            panel,
+            from_=0.3,
+            to=2.5,
+            resolution=0.1,
+            orient="horizontal",
+            command=change_size,
+            bg=bg,
+            fg="#222222",
+            troughcolor="#A6C8F0",
+            activebackground=blue,
+            highlightthickness=0,
+            bd=1,
+            relief="sunken",
+            font=("Tahoma", 8),
+            showvalue=True,
+            sliderlength=18
+        )
+        size_slider.set(current_size)
+        size_slider.pack(fill="x", pady=(0, 8))
 
-    tk.Label(
-        panel,
-        text="Character Appearance",
-        bg=bg,
-        fg=dark_blue,
-        font=("Tahoma", 9, "bold")
-    ).pack(
-        anchor="w",
-        pady=(2, 5)
-    )
+        tk.Label(
+            panel,
+            text="GIF Playback Speed",
+            bg=bg,
+            font=("Tahoma", 9, "bold")
+        ).pack(anchor="w")
 
-    tk.Button(
-        panel,
-        text="Choose Image / GIF",
-        command=choose_image,
-        bg=bg,
-        fg=text_color,
-        font=("Tahoma", 8),
-        relief="raised",
-        bd=2,
-        activebackground="#D6E8FF"
-    ).pack(
-        fill="x",
-        pady=3
-    )
+        speed_slider = tk.Scale(
+            panel,
+            from_=0.25,
+            to=3.0,
+            resolution=0.25,
+            orient="horizontal",
+            command=change_speed,
+            bg=bg,
+            fg="#222222",
+            troughcolor="#A6C8F0",
+            activebackground=blue,
+            highlightthickness=0,
+            bd=1,
+            relief="sunken",
+            font=("Tahoma", 8),
+            showvalue=True,
+            sliderlength=18
+        )
+        speed_slider.set(current_speed)
+        speed_slider.pack(fill="x", pady=(0, 10))
 
-    tk.Button(
-        panel,
-        text="Reset to Default",
-        command=reset_character,
-        bg=bg,
-        fg=text_color,
-        font=("Tahoma", 8),
-        relief="raised",
-        bd=2,
-        activebackground="#D6E8FF"
-    ).pack(
-        fill="x",
-        pady=3
-    )
+        tk.Label(
+            panel,
+            text="Character Appearance",
+            bg=bg,
+            fg=dark_blue,
+            font=("Tahoma", 9, "bold")
+        ).pack(anchor="w", pady=(2, 5))
 
-    button_frame = tk.Frame(
-        panel,
-        bg=bg
-    )
-    button_frame.pack(
-        fill="x",
-        pady=(8, 0)
-    )
+        tk.Button(
+            panel,
+            text="Choose Image / GIF",
+            command=choose_image,
+            bg=bg,
+            font=("Tahoma", 8),
+            relief="raised",
+            bd=2
+        ).pack(fill="x", pady=3)
 
-    tk.Button(
-        button_frame,
-        text="OK",
-        width=9,
-        command=close_settings,
-        bg=bg,
-        fg=text_color,
-        font=("Tahoma", 8),
-        relief="raised",
-        bd=2,
-        activebackground="#D6E8FF"
-    ).pack(side="right")
+        tk.Button(
+            panel,
+            text="Reset to Default",
+            command=reset_image,
+            bg=bg,
+            font=("Tahoma", 8),
+            relief="raised",
+            bd=2
+        ).pack(fill="x", pady=3)
 
-    tk.Label(
-        panel,
-        text="To leave program press [ESCAPE]",
-        bg=bg,
-        fg=dark_blue,
-        font=("Tahoma", 9, "bold")
-    ).pack(
-        anchor="w",
-        pady=(2, 5)
-    )
-    tk.Label(
-        panel,
-        text="KTesktop by @KTo",
-        bg=bg,
-        fg=dark_blue,
-        font=("Tahoma", 5, "bold")
-    ).pack(
-        anchor="w",
-        pady=(2, 5)
-    )
+        buttons = tk.Frame(panel, bg=bg)
+        buttons.pack(fill="x", pady=(8, 0))
 
-    settings_window.protocol(
-        "WM_DELETE_WINDOW",
-        close_settings
-    )
+        tk.Button(
+            buttons,
+            text="OK",
+            width=9,
+            command=close_settings,
+            bg=bg,
+            font=("Tahoma", 8),
+            relief="raised",
+            bd=2
+        ).pack(side="right")
 
-label.bind("<Button-3>", open_settings)
+        tk.Label(
+            panel,
+            text="To leave program press [ESCAPE]",
+            bg=bg,
+            fg=dark_blue,
+            font=("Tahoma", 9, "bold")
+        ).pack(anchor="w", pady=(2, 5))
 
-root.bind(
-    "<Escape>",
-    lambda event: root.destroy()
-)
+        tk.Label(
+            panel,
+            text="KTesktop by @KTo",
+            bg=bg,
+            fg=dark_blue,
+            font=("Tahoma", 5, "bold")
+        ).pack(anchor="w", pady=(2, 5))
 
-if not os.path.exists(default_gif_path):
-    messagebox.showerror(
-        "Missing Default",
-        "Please put test.gif next to the application.",
-        parent=root
-    )
-    root.destroy()
-    raise SystemExit
+        window.protocol("WM_DELETE_WINDOW", close_settings)
 
-load_character(default_gif_path)
+    def handle_message(packet):
+        event = packet.get("event")
 
-root.mainloop()
+        if event == "open_settings":
+            x = packet.get("x", 100)
+            y = packet.get("y", 100)
+            width = packet.get("width", 0)
+            open_settings(x + width + 10, y)
+
+        elif event == "image_error":
+            messagebox.showerror(
+                "Image Error",
+                packet.get("error", "Could not load image."),
+                parent=settings_window or root
+            )
+
+        elif event == "renderer_error":
+            messagebox.showerror(
+                "Renderer Error",
+                packet.get("error", "The renderer failed."),
+                parent=root
+            )
+            shutdown()
+
+        elif event in ("exit_requested", "renderer_process_exited"):
+            shutdown()
+
+    if not os.path.exists(DEFAULT_IMAGE):
+        messagebox.showerror(
+            "Missing Default",
+            "Please put test.gif next to main.py.",
+            parent=root
+        )
+        root.destroy()
+        return
+
+    renderer = RendererController(root, handle_message)
+    renderer.start()
+
+    def load_default_when_ready():
+        if shutting_down:
+            return
+
+        if renderer.authenticated.is_set():
+            renderer.send("load", path=DEFAULT_IMAGE)
+            renderer.send("size", value=current_size)
+            renderer.send("speed", value=current_speed)
+        elif renderer.process and renderer.process.poll() is None:
+            root.after(100, load_default_when_ready)
+
+    root.after(100, load_default_when_ready)
+    root.bind("<Escape>", lambda _event: shutdown())
+    root.protocol("WM_DELETE_WINDOW", shutdown)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+
+    if len(args) >= 4 and args[0] == "--kdesktop-renderer":
+        renderer_process(args[1], args[2], args[3])
+    else:
+        run_controller()
