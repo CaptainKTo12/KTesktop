@@ -18,39 +18,39 @@ Linux dependencies:
 
 Fedora:  
 
-sudo dnf install python3 python3-tkinter  
+**sudo dnf install python3 python3-tkinter**  
 
 Ubuntu / Linux Mint:  
 
-sudo apt update  
-sudo apt install python3 python3-tk  
+**sudo apt update**  
+**sudo apt install python3 python3-tk**  
 
 Arch Linux:  
 
-sudo pacman -S tk  
+**sudo pacman -S tk**  
 
 ------------------------
 
 Install PyInstaller:
 
-python -m pip install pyinstaller
+**python -m pip install pyinstaller**
 
-Windows
+Windows:
 
-python -m PyInstaller --clean --onefile --windowed --name KDesktop main.py
+**python -m PyInstaller --clean --onefile --windowed --name KTesktop main.py**
 
 The executable will be generated in the dist folder.
 
-Place test.gif next to KDesktop.exe.
+If there is no test.gif, place it next to the executable.
 
-Linux
+Linux:
 
-python3 -m PyInstaller --clean --onefile --name KDesktop main.py
+**python3 -m PyInstaller --clean --onefile --name KTesktop main.py**
 
 Make the generated executable runnable:
 
-chmod +x dist/KDesktop
+**chmod +x dist/KTesktop**
 
-Place test.gif next to the executable.
+If there is no test.gif, place it next to the executable.
 
 Note: Build separately on Windows and Linux. PyInstaller does not cross-compile between operating systems.
