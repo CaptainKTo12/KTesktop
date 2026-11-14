@@ -1,14 +1,14 @@
 
 A simple desktop companion engine with customization settings and text-to-speech (TTS) support.
 
-## Clone the repository
+Clone the repository
 
 ```bash
 git clone https://github.com/CaptainKTo12/KTesktop.git
 cd KTesktop
 ```
 
-## Requirements
+Requirements
 
 - Python 3.10
 - Pillow
@@ -16,7 +16,7 @@ cd KTesktop
 - Tkinter
 - pyttsx3
 
-## Install Python dependencies
+Install Python dependencies
 
 ```bash
 python -m pip install Pillow PySide6 pyttsx3
@@ -24,7 +24,7 @@ python -m pip install Pillow PySide6 pyttsx3
 
 Tkinter is included with many Python installations, but on Linux you may need to install it separately.
 
-## Linux dependencies
+Linux dependencies
 
 **Fedora:**
 
@@ -47,7 +47,7 @@ sudo pacman -S tk
 
 ---
 
-## Install PyInstaller
+Install PyInstaller
 
 ```bash
 python -m pip install pyinstaller
