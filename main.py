@@ -21,6 +21,100 @@ APP_DIR = (
 )
 DEFAULT_IMAGE = os.path.join(APP_DIR, "test.gif")
 
+
+class TTSWorker:
+    """Owns the pyttsx3 engine on one background thread."""
+    def __init__(self, callback):
+        self.callback = callback
+        self.commands = queue.Queue()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def send(self, command, **data):
+        self.commands.put((command, data))
+
+    @staticmethod
+    def _voice_gender(voice):
+        details = " ".join([
+            str(getattr(voice, "name", "")),
+            str(getattr(voice, "id", "")),
+            str(getattr(voice, "gender", "")),
+        ]).lower()
+        female_names = ("zira", "hazel", "susan", "samantha", "victoria", "karen", "female")
+        male_names = ("david", "mark", "george", "james", "daniel", "male")
+        if any(name in details for name in female_names) or "woman" in details:
+            return "female"
+        if any(name in details for name in male_names) or "man" in details:
+            return "male"
+        return "unknown"
+
+    def _run(self):
+        try:
+            import pyttsx3
+            engine = pyttsx3.init()
+            voices = engine.getProperty("voices") or []
+            voice_data = [
+                {
+                    "id": str(getattr(voice, "id", "")),
+                    "name": str(getattr(voice, "name", "") or getattr(voice, "id", "System voice")),
+                    "gender": self._voice_gender(voice),
+                }
+                for voice in voices
+            ]
+            self.callback("ready", voices=voice_data)
+
+            engine.startLoop(False)
+
+            try:
+                import pythoncom
+            except ImportError:
+                pythoncom = None
+
+            selected_gender = "female"
+            running = True
+
+            while running:
+                try:
+                    command, data = self.commands.get(timeout=0.01)
+                    if command == "shutdown":
+                        engine.stop()
+                        running = False
+                    elif command == "stop":
+                        engine.stop()
+                    elif command == "voice":
+                        selected_gender = data.get("gender", "female")
+                        candidates = [
+                            v for v in voices
+                            if self._voice_gender(v) == selected_gender
+                        ]
+                        if candidates:
+                            engine.setProperty("voice", candidates[0].id)
+                            self.callback(
+                                "voice_selected",
+                                gender=selected_gender,
+                                name=str(getattr(candidates[0], "name", candidates[0].id)),
+                            )
+                        else:
+                            self.callback(
+                                "voice_unavailable",
+                                gender=selected_gender,
+                            )
+                    elif command == "speak":
+                        text = data.get("text", "").strip()
+                        if text:
+                            engine.stop()
+                            engine.say(text)
+                except queue.Empty:
+                    pass
+                engine.iterate()
+                if pythoncom is not None:
+                    pythoncom.PumpWaitingMessages()
+
+            engine.endLoop()
+        except Exception as error:
+            self.callback("error", error=str(error))
+
+
 def renderer_process(host, port, token):
     from PySide6.QtCore import Qt, QTimer, QObject, Signal, Slot
     from PySide6.QtGui import QImage, QPixmap
@@ -442,6 +536,12 @@ def run_controller():
 
     renderer = None
     settings_window = None
+    tts_window = None
+    tts_enabled = False
+    tts_text_widget = None
+    tts_voice_choice = None
+    tts_worker = TTSWorker(lambda event, **data: root.after(0, handle_tts_event, event, data))
+    tts_voice_names = {"female": [], "male": []}
     current_size = 1.0
     current_speed = 1.0
     shutting_down = False
@@ -455,6 +555,7 @@ def run_controller():
 
         if renderer:
             renderer.close()
+        tts_worker.send("shutdown")
 
         try:
             root.destroy()
@@ -484,13 +585,150 @@ def run_controller():
 
         settings_window = None
 
+    def close_tts_window():
+        nonlocal tts_window
+        if tts_window:
+            try:
+                tts_window.destroy()
+            except tk.TclError:
+                pass
+        tts_window = None
+
+    def handle_tts_event(event, data):
+        if shutting_down:
+            return
+        if event == "ready":
+            for voice in data.get("voices", []):
+                gender = voice.get("gender", "unknown")
+                if gender in tts_voice_names:
+                    tts_voice_names[gender].append(voice)
+            # Select the best available female voice by default.
+            tts_worker.send("voice", gender="female")
+            refresh_voice_list()
+        elif event == "error":
+            messagebox.showerror(
+                "Text-to-Speech Error",
+                "Could not start pyttsx3. Install it with:\n\n"
+                "python -m pip install pyttsx3\n\n" + data.get("error", ""),
+                parent=root
+            )
+        elif event == "voice_unavailable":
+            if tts_window and tts_window.winfo_exists():
+                messagebox.showinfo(
+                    "Voice unavailable",
+                    "No " + data.get("gender", "selected") +
+                    " voice was detected on this computer. The system voice will be used.",
+                    parent=tts_window
+                )
+
+    def refresh_voice_list():
+        if not tts_window or not tts_window.winfo_exists() or tts_voice_choice is None:
+            return
+        tts_voice_choice["values"] = ("Female", "Male")
+        if not tts_voice_choice.get():
+            tts_voice_choice.set("Female")
+
+    def set_tts_voice(_event=None):
+        if tts_enabled:
+            gender = "male" if tts_voice_choice.get().lower() == "male" else "female"
+            tts_worker.send("voice", gender=gender)
+
+    def speak_text():
+        if not tts_enabled:
+            return
+        text = tts_text_widget.get("1.0", "end-1c").strip()
+        if not text:
+            messagebox.showinfo("Nothing to say", "Write some text first.", parent=tts_window)
+            return
+        set_tts_voice()
+        tts_worker.send("speak", text=text)
+
+    def stop_speaking():
+        tts_worker.send("stop")
+
+    def open_tts_window():
+        nonlocal tts_window
+        if tts_window and tts_window.winfo_exists():
+            tts_window.deiconify()
+            tts_window.lift()
+            return
+
+        nonlocal tts_text_widget, tts_voice_choice
+        from tkinter import ttk
+        window = tk.Toplevel(root)
+        tts_window = window
+        window.title("Text-to-Speech (using pyttsx3)")
+        window.geometry("390x330")
+        window.minsize(340, 280)
+        window.attributes("-topmost", True)
+        window.configure(bg="#ECE9D8")
+
+        tk.Label(
+            window, text="Write something for your character to say",
+            bg="#ECE9D8", fg="#1941A5",
+            font=("Tahoma", 10, "bold")
+        ).pack(anchor="w", padx=12, pady=(12, 6))
+
+        text_frame = tk.Frame(window, bg="#ECE9D8")
+        text_frame.pack(fill="both", expand=True, padx=12)
+        text_scroll = tk.Scrollbar(text_frame)
+        text_scroll.pack(side="right", fill="y")
+        tts_text_widget = tk.Text(
+            text_frame, wrap="word", height=8,
+            yscrollcommand=text_scroll.set, font=("Tahoma", 10)
+        )
+        tts_text_widget.pack(side="left", fill="both", expand=True)
+        text_scroll.config(command=tts_text_widget.yview)
+
+        voice_row = tk.Frame(window, bg="#ECE9D8")
+        voice_row.pack(fill="x", padx=12, pady=10)
+        tk.Label(
+            voice_row, text="Voice:", bg="#ECE9D8",
+            font=("Tahoma", 9, "bold")
+        ).pack(side="left")
+        tts_voice_choice = ttk.Combobox(
+            voice_row, values=("Female", "Male"),
+            state="readonly", width=12
+        )
+        tts_voice_choice.set("Female")
+        tts_voice_choice.pack(side="left", padx=8)
+        tts_voice_choice.bind("<<ComboboxSelected>>", set_tts_voice)
+
+        button_row = tk.Frame(window, bg="#ECE9D8")
+        button_row.pack(fill="x", padx=12, pady=(0, 12))
+        tk.Button(
+            button_row, text="Speak", command=speak_text,
+            width=12, bg="#D8E5F5", relief="raised"
+        ).pack(side="left")
+        tk.Button(
+            button_row, text="Stop", command=stop_speaking,
+            width=10, bg="#F2DADA", relief="raised"
+        ).pack(side="left", padx=8)
+        tk.Button(
+            button_row, text="Close", command=close_tts_window,
+            width=10, relief="raised"
+        ).pack(side="right")
+        window.protocol("WM_DELETE_WINDOW", close_tts_window)
+
+        if tts_voice_names["female"]:
+            refresh_voice_list()
+
+    def toggle_tts(enabled):
+        nonlocal tts_enabled
+        tts_enabled = bool(enabled)
+        if tts_enabled:
+            open_tts_window()
+        else:
+            tts_worker.send("stop")
+            close_tts_window()
+
     def choose_image():
         if not settings_window:
             return
 
         path = filedialog.askopenfilename(
             parent=settings_window,
-            title="Choose Your Buddy",
+            title="Choose Your Character",
             filetypes=[
                 ("Supported images",
                  "*.gif *.png *.jpg *.jpeg *.bmp *.webp"),
@@ -522,7 +760,7 @@ def run_controller():
         settings_window = window
 
         window.title("Settings")
-        window.geometry(f"255x390+{int(x)}+{int(y)}")
+        window.geometry(f"285x490+{int(x)}+{int(y)}")
         window.resizable(False, False)
         window.attributes("-topmost", True)
 
@@ -638,6 +876,36 @@ def run_controller():
             panel,
             text="Reset to Default",
             command=reset_image,
+            bg=bg,
+            font=("Tahoma", 8),
+            relief="raised",
+            bd=2
+        ).pack(fill="x", pady=3)
+
+        tk.Label(
+            panel,
+            text="Text-to-Speech",
+            bg=bg,
+            fg=dark_blue,
+            font=("Tahoma", 9, "bold")
+        ).pack(anchor="w", pady=(10, 3))
+
+        tts_var = tk.BooleanVar(value=tts_enabled)
+        tk.Checkbutton(
+            panel,
+            text="Turn TTS on (opens text window)",
+            variable=tts_var,
+            command=lambda: toggle_tts(tts_var.get()),
+            bg=bg,
+            activebackground=bg,
+            font=("Tahoma", 8),
+            anchor="w"
+        ).pack(fill="x", pady=(0, 3))
+
+        tk.Button(
+            panel,
+            text="Open TTS Window",
+            command=lambda: (tts_var.set(True), toggle_tts(True), open_tts_window()),
             bg=bg,
             font=("Tahoma", 8),
             relief="raised",
